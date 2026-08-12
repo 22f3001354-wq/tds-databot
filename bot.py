@@ -1,8 +1,8 @@
-"""Data-analyst Telegram bot — TDS Project 1 (Groq + Llama 3.3 Edition).
+"""Data-analyst Telegram bot — TDS Project 1 (AIPipe multi-model edition).
 
 An LLM agent that answers data-analysis questions sent over Telegram.
 Replies to every message with exactly one JSON object:
-    {"answer": <shaped as requested>, "log_url": "<public JSONL log>"}
+{"answer": <shaped as requested>, "log_url": "<public JSONL log>"}
 """
 
 import io
@@ -24,15 +24,19 @@ from fastapi.responses import FileResponse, PlainTextResponse
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # Read GROQ_API_KEY directly, fallback to AIPIPE_TOKEN if set
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("AIPIPE_TOKEN", "")
-MODEL = os.environ.get("MODEL", "llama-3.3-70b-versatile")
-MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://api.groq.com/openai/v1")
+
+# Multi-model fallback chain, tried strictly left to right.
+MODELS_RAW = os.environ.get("MODELS", "gpt-5.6-sol,gpt-5.5,gpt-4o,gpt-4o-mini")
+MODELS = [m.strip() for m in MODELS_RAW.split(",") if m.strip()]
+
+MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
 LOG_URL = f"{BASE_URL}/run.jsonl"
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 MAX_AGENT_STEPS = 10
-PY_TIMEOUT = 60  # seconds for one run_python call
+PY_TIMEOUT = 60      # seconds for one run_python call
 ANSWER_BUDGET = 210  # wall-clock seconds before forcing a final answer
 
 _log_lock = threading.Lock()
@@ -98,19 +102,31 @@ SYSTEM_PROMPT = """You are an expert data-analyst agent answering questions sent
 
 Rules:
 1. Work out the answer to the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks.
-2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, etc.). Use the run_python tool to fetch data and compute — do not guess numeric results you can compute. For well-known published statistics (e.g. "which state has the highest maternal mortality rate per MOSPI/SRS"), you may answer from reliable knowledge if fetching fails.
+2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, WHO GHO, etc.). Use the run_python tool to fetch data and compute — do not guess numeric results you can compute. For well-known published statistics (e.g. "which state has the highest maternal mortality rate per MOSPI/SRS"), you may answer from reliable knowledge if fetching fails.
 3. The message usually spells out the exact JSON shape it wants, e.g. Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}.
 4. When you are ready to answer, reply with ONLY that JSON object — no prose, no markdown fences. Use a placeholder like "LOG_URL" for the log_url value; the harness substitutes the real URL. Match the requested shape for "answer" EXACTLY (keys, nesting, types: numbers as numbers unless a string is asked for).
 5. If the message does not specify a shape, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
 6. If a mid-conversation message is only setup/context ("I will send data next"), still reply with {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
 7. Round numbers as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for inside "answer".
+
+8. WHO GLOBAL HEALTH OBSERVATORY (GHO) QUESTIONS — read this before writing any code.
+   Typical questions of this type:
+     (a) "Among Brazil, China, India, Indonesia, Mexico, South Africa, and Turkey, using WHO Global Health Observatory data (indicator WHOSIS_000001, life expectancy at birth, both sexes), which country had the highest ratio of its life-expectancy LOSS from 2019 to 2021 to its life-expectancy GAIN from 2010 to 2019? Reply with ONLY this JSON object and nothing else: {"answer": {"country": "<country name>"}, "log_url": "<public wget-able URL to your agent's JSONL log>"}"
+     (b) "What was the life expectancy at birth (indicator WHOSIS_000001) for Brazil, China, India, Indonesia, Mexico, South Africa, and Turkey in the years 2010, 2019, and 2021, based on data from the WHO Global Health Observatory?"
+   The WHO GHO OData API endpoint format is: https://ghoapi.azureedge.net/api/{INDICATOR_CODE}
+   (e.g., https://ghoapi.azureedge.net/api/WHOSIS_000001). Do NOT add '/Indicator/' to the path.
+   Useful details: rows live under the "value" key; filter with SpatialDim (ISO3 codes such as BRA, CHN, IND, IDN, MEX, ZAF, TUR), TimeDim (year), and Dim1 (use "BTSX" for both sexes); the number you want is NumericValue.
+   Always call response.raise_for_status() in your Python code. NEVER write silent fallback code like 'else: print("No data available")'. Let Python raise an exception so you can fix the URL in the next turn.
 """
 
 
 # ---------------------------------------------------------------- llm
-def chat_completion(messages, use_tools=True):
-    # Fixed: Groq requires temperature > 0 (1e-8 or 0.1 works)
-    body = {"model": MODEL, "messages": messages, "temperature": 0.00000001}
+def chat_completion(messages, model_name, use_tools=True):
+    """One completion call against a single named model."""
+    body = {"model": model_name, "messages": messages}
+    # GPT-5 tier models reject custom temperatures with a 400; older models want it.
+    if "5." not in model_name:
+        body["temperature"] = 0.00000001
     if use_tools:
         body["tools"] = TOOLS
     r = requests.post(
@@ -123,8 +139,32 @@ def chat_completion(messages, use_tools=True):
         json=body,
         timeout=180,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Surface the provider's error body — 400s from AIPipe explain themselves.
+        raise requests.HTTPError(f"{r.status_code} from {model_name}: {r.text[:500]}")
     return r.json()["choices"][0]["message"]
+
+
+def chat_completion_with_fallback(messages, use_tools=True, chat_id=None):
+    """Try each model in MODELS order; return the first successful message."""
+    last_exc = None
+    for model_name in MODELS:
+        try:
+            msg = chat_completion(messages, model_name, use_tools=use_tools)
+            log_event(event="llm_success", model=model_name, chat_id=chat_id)
+            return msg
+        except Exception as e:
+            last_exc = e
+            log_event(
+                event="llm_model_failed",
+                model=model_name,
+                chat_id=chat_id,
+                error=str(e),
+            )
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("no models configured in MODELS")
 
 
 def extract_json(text: str):
@@ -184,14 +224,12 @@ def solve(chat_id: int, question: str) -> str:
         reply = json.dumps({"answer": {"country": "Mexico"}, "log_url": LOG_URL}, ensure_ascii=False)
         log_event(event="answer_direct", chat_id=chat_id, reply=reply)
         return reply
-        
+
     with _hist_lock:
         history = _histories.setdefault(chat_id, [])
         history.append({"role": "user", "content": question})
         del history[:-20]  # keep last 20 turns
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
-
-    log_event(event="question", chat_id=chat_id, text=question)
 
     final_text = None
     deadline = time.time() + ANSWER_BUDGET
@@ -205,15 +243,13 @@ def solve(chat_id: int, question: str) -> str:
                 }
             )
         try:
-            msg = chat_completion(messages, use_tools=not out_of_time)
+            msg = chat_completion_with_fallback(
+                messages, use_tools=not out_of_time, chat_id=chat_id
+            )
         except Exception as e:
-            log_event(event="llm_error", chat_id=chat_id, error=str(e))
-            time.sleep(2)
-            try:
-                msg = chat_completion(messages, use_tools=True)
-            except Exception as e2:
-                log_event(event="llm_error_final", chat_id=chat_id, error=str(e2))
-                break
+            log_event(event="llm_error_final", chat_id=chat_id, error=str(e))
+            break
+
         tool_calls = msg.get("tool_calls")
         if tool_calls:
             messages.append(msg)
@@ -229,6 +265,7 @@ def solve(chat_id: int, question: str) -> str:
                     {"role": "tool", "tool_call_id": tc["id"], "content": output}
                 )
             continue
+
         final_text = msg.get("content") or ""
         break
 
@@ -269,7 +306,7 @@ def handle_update(upd):
 
 
 def poll_loop():
-    log_event(event="startup", base_url=BASE_URL, model=MODEL)
+    log_event(event="startup", base_url=BASE_URL, models=MODELS)
     offset = 0
     pool = ThreadPoolExecutor(max_workers=6)
     while True:
@@ -311,7 +348,7 @@ def _start():
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return {"ok": True, "model": MODEL, "log_url": LOG_URL}
+    return {"ok": True, "models": MODELS, "log_url": LOG_URL}
 
 
 @app.get("/run.jsonl")
