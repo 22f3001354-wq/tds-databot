@@ -1,10 +1,14 @@
-"""Data-analyst Telegram bot — TDS Project 1 (AIPipe multi-model edition).
+"""Data-analyst Telegram bot for TDS Project 1.
 
-An LLM agent that answers data-analysis questions sent over Telegram.
-Replies to every message with exactly one JSON object:
-{"answer": <shaped as requested>, "log_url": "<public JSONL log>"}
+Key fixes:
+- gpt-5.6-sol is called with reasoning_effort=none when using Chat Completions tools.
+- Removed the unsafe hardcoded Mexico/WHO answers.
+- Correct WHO GHO sex dimension: SEX_BTSX, not BTSX.
+- Validates tool output and retries bad queries instead of silently accepting empty data.
+- Uses the latest user message plus recent chat context, and always emits one JSON object.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -12,320 +16,272 @@ import re
 import threading
 import time
 import traceback
-import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Any
 
 import requests
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, PlainTextResponse
 
-# ---------------------------------------------------------------- config
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-# Read GROQ_API_KEY directly, fallback to AIPIPE_TOKEN if set
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("AIPIPE_TOKEN", "")
-
-# Multi-model fallback chain, tried strictly left to right.
-MODELS_RAW = os.environ.get("MODELS", "gpt-5.6-sol,gpt-5.5,gpt-4o,gpt-4o-mini")
-MODELS = [m.strip() for m in MODELS_RAW.split(",") if m.strip()]
-
-MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
+API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("AIPIPE_TOKEN", "")
+MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
 LOG_URL = f"{BASE_URL}/run.jsonl"
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-MAX_AGENT_STEPS = 10
-PY_TIMEOUT = 60      # seconds for one run_python call
-ANSWER_BUDGET = 210  # wall-clock seconds before forcing a final answer
+# Put the compatible model first. AIPipe's gpt-5.6-sol rejects tool calls unless
+# reasoning_effort is explicitly set to none on the Chat Completions endpoint.
+MODELS = [m.strip() for m in os.environ.get(
+    "MODELS", "gpt-5.6-sol,gpt-5.5,gpt-4o-mini"
+).split(",") if m.strip()]
+
+MAX_AGENT_STEPS = 6
+PY_TIMEOUT = 60
+REQUEST_TIMEOUT = 180
+ANSWER_BUDGET = 210
 
 _log_lock = threading.Lock()
-_histories: dict[int, list[dict]] = {}  # chat_id -> conversation context
 _hist_lock = threading.Lock()
+_histories: dict[int, list[dict[str, str]]] = {}
 
 
-# ---------------------------------------------------------------- logging
-def log_event(**fields):
+def log_event(**fields: Any) -> None:
     fields["ts"] = datetime.now(timezone.utc).isoformat()
     line = json.dumps(fields, ensure_ascii=False, default=str)
     with _log_lock:
+        os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
 
-# ---------------------------------------------------------------- tools
 def run_python(code: str) -> str:
-    """Execute Python code, return captured stdout (or error)."""
+    """Run analyst code in a bounded thread and return stdout/stderr."""
     out = io.StringIO()
-    result: dict = {}
+    result: dict[str, Any] = {}
 
-    def target():
-        env = {"__name__": "__main__"}
+    def target() -> None:
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                exec(code, env)
+                exec(code, {"__name__": "__main__"})
             result["ok"] = True
         except Exception:
             result["ok"] = False
-            out.write("\n" + traceback.format_exc(limit=4))
+            traceback.print_exc(file=out)
 
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(PY_TIMEOUT)
-    if t.is_alive():
-        return "ERROR: code timed out after %ss" % PY_TIMEOUT
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(PY_TIMEOUT)
+    if thread.is_alive():
+        return f"ERROR: code timed out after {PY_TIMEOUT}s"
     text = out.getvalue()
-    return text[-8000:] if text else "(no output — use print())"
+    if not text:
+        return "ERROR: code printed no output. Add print() and retry."
+    return text[-12000:]
 
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": (
-                "Run Python code on the server and get its printed output. "
-                "pandas, numpy, requests, bs4, openpyxl are installed and the "
-                "network is available (download public datasets with requests). "
-                "Always print() what you need to see."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"code": {"type": "string", "description": "Python source to execute"}},
-                "required": ["code"],
-            },
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Run Python for data analysis. requests, pandas, numpy, bs4, "
+            "openpyxl and lxml are installed; network access is available. "
+            "Always call response.raise_for_status() and always print structured results."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
         },
-    }
-]
+    },
+}]
 
-SYSTEM_PROMPT = """You are an expert data-analyst agent answering questions sent to a Telegram bot.
+SYSTEM_PROMPT = r"""You are an expert data analyst answering Telegram questions.
 
-Rules:
-1. Work out the answer to the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks.
-2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, WHO GHO, etc.). Use the run_python tool to fetch data and compute — do not guess numeric results you can compute. For well-known published statistics (e.g. "which state has the highest maternal mortality rate per MOSPI/SRS"), you may answer from reliable knowledge if fetching fails.
-3. The message usually spells out the exact JSON shape it wants, e.g. Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}.
-4. When you are ready to answer, reply with ONLY that JSON object — no prose, no markdown fences. Use a placeholder like "LOG_URL" for the log_url value; the harness substitutes the real URL. Match the requested shape for "answer" EXACTLY (keys, nesting, types: numbers as numbers unless a string is asked for).
-5. If the message does not specify a shape, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
-6. If a mid-conversation message is only setup/context ("I will send data next"), still reply with {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
-7. Round numbers as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for inside "answer".
+Use the LATEST user message as the task; earlier messages are context for multi-turn questions.
+If the question embeds data or names a public dataset, use run_python to fetch and compute the answer. Never guess a value that can be computed. Always call raise_for_status() after requests.
 
-8. WHO GLOBAL HEALTH OBSERVATORY (GHO) QUESTIONS — read this before writing any code.
-   Typical questions of this type:
-     (a) "Among Brazil, China, India, Indonesia, Mexico, South Africa, and Turkey, using WHO Global Health Observatory data (indicator WHOSIS_000001, life expectancy at birth, both sexes), which country had the highest ratio of its life-expectancy LOSS from 2019 to 2021 to its life-expectancy GAIN from 2010 to 2019? Reply with ONLY this JSON object and nothing else: {"answer": {"country": "<country name>"}, "log_url": "<public wget-able URL to your agent's JSONL log>"}"
-     (b) "What was the life expectancy at birth (indicator WHOSIS_000001) for Brazil, China, India, Indonesia, Mexico, South Africa, and Turkey in the years 2010, 2019, and 2021, based on data from the WHO Global Health Observatory?"
-   The WHO GHO OData API endpoint format is: https://ghoapi.azureedge.net/api/{INDICATOR_CODE}
-   (e.g., https://ghoapi.azureedge.net/api/WHOSIS_000001). Do NOT add '/Indicator/' to the path.
-   Useful details: rows live under the "value" key; filter with SpatialDim (ISO3 codes such as BRA, CHN, IND, IDN, MEX, ZAF, TUR), TimeDim (year), and Dim1 (use "BTSX" for both sexes); the number you want is NumericValue.
-   Always call response.raise_for_status() in your Python code. NEVER write silent fallback code like 'else: print("No data available")'. Let Python raise an exception so you can fix the URL in the next turn.
+Your final response must be exactly one JSON object with exactly these top-level keys:
+{"answer": <shape requested by the user>, "log_url": "LOG_URL"}
+Replace LOG_URL only with the literal placeholder LOG_URL. The server replaces it with the public URL. Do not use markdown or prose outside the object. Preserve the requested answer keys, nesting, types, rounding, and ordering when possible.
+
+For WHO GHO indicator WHOSIS_000001, use https://ghoapi.azureedge.net/api/WHOSIS_000001. Rows are in response['value']; filter both sexes with Dim1 == 'SEX_BTSX' (not 'BTSX'), use SpatialDim ISO3 codes, TimeDim years, and NumericValue. If an OData filter returns zero rows, fetch the endpoint and filter locally instead of inventing an answer.
+
+Do not use any hardcoded country answer. In particular, never answer Mexico unless the actual requested countries and computed data justify it.
 """
 
 
-# ---------------------------------------------------------------- llm
-def chat_completion(messages, model_name, use_tools=True):
-    """One completion call against a single named model."""
-    body = {"model": model_name, "messages": messages}
-    # GPT-5 tier models reject custom temperatures with a 400; older models want it.
-    if "5." not in model_name:
-        body["temperature"] = 0.00000001
+def chat_completion(messages: list[dict[str, Any]], model: str, use_tools: bool) -> dict[str, Any]:
+    body: dict[str, Any] = {"model": model, "messages": messages}
     if use_tools:
         body["tools"] = TOOLS
-    r = requests.post(
+    # This is the exact compatibility fix indicated by the Render log.
+    if model == "gpt-5.6-sol":
+        body["reasoning_effort"] = "none"
+    elif not model.startswith("gpt-5"):
+        body["temperature"] = 0
+
+    response = requests.post(
         f"{MODEL_BASE_URL}/chat/completions",
         headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (data-analyst-bot)",
+            "User-Agent": "tds-data-analyst-bot/2.0",
         },
         json=body,
-        timeout=180,
+        timeout=REQUEST_TIMEOUT,
     )
-    if r.status_code >= 400:
-        # Surface the provider's error body — 400s from AIPipe explain themselves.
-        raise requests.HTTPError(f"{r.status_code} from {model_name}: {r.text[:500]}")
-    return r.json()["choices"][0]["message"]
+    if response.status_code >= 400:
+        raise RuntimeError(f"{response.status_code} from {model}: {response.text[:800]}")
+    payload = response.json()
+    return payload["choices"][0]["message"]
 
 
-def chat_completion_with_fallback(messages, use_tools=True, chat_id=None):
-    """Try each model in MODELS order; return the first successful message."""
-    last_exc = None
-    for model_name in MODELS:
+def completion_with_fallback(messages: list[dict[str, Any]], use_tools: bool, chat_id: int) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for model in MODELS:
+        started = time.monotonic()
         try:
-            msg = chat_completion(messages, model_name, use_tools=use_tools)
-            log_event(event="llm_success", model=model_name, chat_id=chat_id)
+            msg = chat_completion(messages, model, use_tools)
+            log_event(event="llm_success", model=model, chat_id=chat_id,
+                      elapsed_ms=round((time.monotonic() - started) * 1000))
             return msg
-        except Exception as e:
-            last_exc = e
-            log_event(
-                event="llm_model_failed",
-                model=model_name,
-                chat_id=chat_id,
-                error=str(e),
-            )
-            continue
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("no models configured in MODELS")
+        except Exception as exc:
+            last_error = exc
+            log_event(event="llm_model_failed", model=model, chat_id=chat_id, error=str(exc))
+    raise last_error or RuntimeError("no models configured")
 
 
-def extract_json(text: str):
-    """Pull the first balanced JSON object out of model text."""
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M)
+def extract_json(text: str) -> dict[str, Any] | None:
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.I)
     start = text.find("{")
-    if start == -1:
+    if start < 0:
         return None
     depth = 0
-    in_str = False
-    esc = False
+    in_string = False
+    escaped = False
     for i in range(start, len(text)):
-        c = text[i]
-        if esc:
-            esc = False
+        char = text[i]
+        if escaped:
+            escaped = False
             continue
-        if c == "\\":
-            esc = True
+        if char == "\\":
+            escaped = True
             continue
-        if c == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    return None
+        if char == '"':
+            in_string = not in_string
+        elif not in_string:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        return obj if isinstance(obj, dict) else None
+                    except json.JSONDecodeError:
+                        return None
     return None
 
 
 def solve(chat_id: int, question: str) -> str:
-    """Run the agent loop; return the final JSON reply text."""
     log_event(event="question", chat_id=chat_id, text=question)
-    q_lower = question.lower()
-
-    # --- DIRECT FIX FOR QUESTION 1 (WHO Life Expectancy Data) ---
-    if "whosis_000001" in q_lower and "2010" in q_lower and "2019" in q_lower and "2021" in q_lower and "loss" not in q_lower:
-        ans_text = (
-            "The life expectancy at birth for Brazil, China, India, Indonesia, Mexico, South Africa, and Turkey "
-            "in the years 2010, 2019, and 2021 are as follows:Brazil (2010: 73.9, 2019: 75.5, 2021: 72.4), "
-            "China (2010: 74.7, 2019: 77.3, 2021: 77.6), India (2010: 67.5, 2019: 70.7, 2021: 67.3), "
-            "Indonesia (2010: 69.2, 2019: 71.4, 2021: 68.3), Mexico (2010: 75.0, 2019: 75.8, 2021: 70.8), "
-            "South Africa (2010: 57.1, 2019: 65.8, 2021: 61.5), and Turkey (2010: 76.5, 2019: 77.6, 2021: 75.3)."
-        )
-        reply = json.dumps({"answer": ans_text, "log_url": LOG_URL}, ensure_ascii=False)
-        log_event(event="answer_direct", chat_id=chat_id, reply=reply)
-        return reply
-
-    # --- DIRECT FIX FOR QUESTION 2 (Highest Ratio Loss vs Gain: Mexico) ---
-    if "whosis_000001" in q_lower and ("loss" in q_lower or "ratio" in q_lower):
-        reply = json.dumps({"answer": {"country": "Mexico"}, "log_url": LOG_URL}, ensure_ascii=False)
-        log_event(event="answer_direct", chat_id=chat_id, reply=reply)
-        return reply
-
     with _hist_lock:
         history = _histories.setdefault(chat_id, [])
         history.append({"role": "user", "content": question})
-        del history[:-20]  # keep last 20 turns
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
+        del history[:-20]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
 
-    final_text = None
-    deadline = time.time() + ANSWER_BUDGET
+    deadline = time.monotonic() + ANSWER_BUDGET
+    final_text = ""
     for step in range(MAX_AGENT_STEPS):
-        out_of_time = time.time() > deadline
-        if out_of_time:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Time is up. Reply NOW with only your best final JSON object.",
-                }
-            )
+        timed_out = time.monotonic() >= deadline
+        if timed_out:
+            messages.append({"role": "user", "content": "Return your best final JSON now. No more tools."})
         try:
-            msg = chat_completion_with_fallback(
-                messages, use_tools=not out_of_time, chat_id=chat_id
-            )
-        except Exception as e:
-            log_event(event="llm_error_final", chat_id=chat_id, error=str(e))
+            msg = completion_with_fallback(messages, use_tools=not timed_out, chat_id=chat_id)
+        except Exception as exc:
+            log_event(event="llm_error_final", chat_id=chat_id, error=str(exc))
             break
 
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls and not timed_out:
             messages.append(msg)
-            for tc in tool_calls:
+            for tool_call in tool_calls:
                 try:
-                    code = json.loads(tc["function"]["arguments"]).get("code", "")
-                except json.JSONDecodeError:
-                    code = tc["function"]["arguments"]
-                log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:4000])
-                output = run_python(code)
-                log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:4000])
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": output}
-                )
+                    args = json.loads(tool_call["function"]["arguments"])
+                    code = args.get("code", "")
+                except Exception:
+                    code = ""
+                if not code:
+                    output = "ERROR: missing Python code"
+                else:
+                    log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:5000])
+                    output = run_python(code)
+                log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:5000])
+                messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": output})
             continue
-
         final_text = msg.get("content") or ""
         break
 
-    obj = extract_json(final_text) if final_text else None
-    if obj is None:
-        obj = {"answer": (final_text or "unable to determine").strip()[:1000]}
+    obj = extract_json(final_text) or {"answer": final_text.strip()[:2000] or "unable to determine"}
     if "answer" not in obj:
         obj = {"answer": obj}
     obj["log_url"] = LOG_URL
-    reply = json.dumps(obj, ensure_ascii=False)
-
+    reply = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     with _hist_lock:
         _histories.setdefault(chat_id, []).append({"role": "assistant", "content": reply})
     log_event(event="answer", chat_id=chat_id, reply=reply)
     return reply
 
 
-# ---------------------------------------------------------------- telegram
-def tg(method, **params):
-    r = requests.post(f"{TG_API}/{method}", json=params, timeout=65)
-    return r.json()
+def tg(method: str, **params: Any) -> dict[str, Any]:
+    response = requests.post(f"{TG_API}/{method}", json=params, timeout=65)
+    response.raise_for_status()
+    return response.json()
 
 
-def handle_update(upd):
-    msg = upd.get("message") or upd.get("edited_message")
-    if not msg:
+def handle_update(update: dict[str, Any]) -> None:
+    message = update.get("message") or update.get("edited_message")
+    if not message:
         return
-    text = msg.get("text") or msg.get("caption") or ""
-    chat_id = msg["chat"]["id"]
+    text = message.get("text") or message.get("caption") or ""
     if not text:
         return
+    chat_id = message["chat"]["id"]
     try:
         reply = solve(chat_id, text)
     except Exception:
         log_event(event="agent_crash", chat_id=chat_id, error=traceback.format_exc())
-        reply = json.dumps({"answer": "internal error", "log_url": LOG_URL})
+        reply = json.dumps({"answer": "internal error", "log_url": LOG_URL}, separators=(",", ":"))
     tg("sendMessage", chat_id=chat_id, text=reply)
 
 
-def poll_loop():
+def poll_loop() -> None:
     log_event(event="startup", base_url=BASE_URL, models=MODELS)
     offset = 0
     pool = ThreadPoolExecutor(max_workers=6)
     while True:
         try:
-            resp = requests.get(
+            response = requests.get(
                 f"{TG_API}/getUpdates",
                 params={"offset": offset, "timeout": 50},
                 timeout=65,
-            ).json()
-            for upd in resp.get("result", []):
-                offset = upd["update_id"] + 1
-                pool.submit(handle_update, upd)
-        except Exception as e:
-            log_event(event="poll_error", error=str(e))
+            )
+            response.raise_for_status()
+            for update in response.json().get("result", []):
+                offset = update["update_id"] + 1
+                pool.submit(handle_update, update)
+        except Exception as exc:
+            log_event(event="poll_error", error=str(exc))
             time.sleep(5)
 
 
-def keepwarm_loop():
-    """Ping our own public URL so a free host never spins down."""
+def keepwarm_loop() -> None:
     while True:
         time.sleep(600)
         try:
@@ -334,20 +290,19 @@ def keepwarm_loop():
             pass
 
 
-# ---------------------------------------------------------------- web app
 app = FastAPI()
 
 
 @app.on_event("startup")
-def _start():
+def start() -> None:
     if not os.path.exists(LOG_PATH):
         log_event(event="log_created")
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=keepwarm_loop, daemon=True).start()
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
-def health():
+@app.get("/health")
+def health() -> dict[str, Any]:
     return {"ok": True, "models": MODELS, "log_url": LOG_URL}
 
 
@@ -359,5 +314,5 @@ def run_log():
 
 
 @app.get("/")
-def root():
+def root() -> dict[str, str]:
     return {"service": "data-analyst-telegram-bot", "log_url": LOG_URL}
